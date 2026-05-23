@@ -1,308 +1,1322 @@
-mkdir cloud-mining-platform
-cd cloud-mining-platform
-npm init -y
-npm install express pg bcryptjs jsonwebtoken otplib qrcode node-cron dotenv express-rate-limit
-PORT=5000
-DATABASE_URL=postgresql://postgres:password@localhost:5432/cloud_mining
-JWT_SECRET=your_super_secret_jwt_key_change_this_in_production
--- Clean setup
-DROP TABLE IF EXISTS payouts CASCADE;
-DROP TABLE IF EXISTS user_contracts CASCADE;
-DROP TABLE IF EXISTS mining_plans CASCADE;
-DROP TABLE IF EXISTS users CASCADE;
-
--- Users Table
-CREATE TABLE users (
-    id SERIAL PRIMARY KEY,
-    username VARCHAR(50) UNIQUE NOT NULL,
-    email VARCHAR(100) UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    twofa_secret TEXT,
-    twofa_enabled BOOLEAN DEFAULT FALSE,
-    balance_btc NUMERIC(16, 8) DEFAULT 0.05000000, -- Seeded with dummy balance for testing
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Mining Plans Available
-CREATE TABLE mining_plans (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(50) NOT NULL,
-    hash_power_ghs NUMERIC(12, 2) NOT NULL,
-    price_usd NUMERIC(10, 2) NOT NULL,
-    duration_days INT NOT NULL,
-    daily_return_btc NUMERIC(16, 8) NOT NULL,
-    is_active BOOLEAN DEFAULT TRUE
-);
-
--- Active User Contracts
-CREATE TABLE user_contracts (
-    id SERIAL PRIMARY KEY,
-    user_id INT REFERENCES users(id) ON DELETE CASCADE,
-    plan_id INT REFERENCES mining_plans(id) ON DELETE RESTRICT,
-    purchase_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    expiry_date TIMESTAMP NOT NULL,
-    status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'expired'))
-);
-
--- Payout Audit Ledger
-CREATE TABLE payouts (
-    id SERIAL PRIMARY KEY,
-    user_id INT REFERENCES users(id) ON DELETE CASCADE,
-    contract_id INT REFERENCES user_contracts(id) ON DELETE SET NULL,
-    amount_btc NUMERIC(16, 8) NOT NULL,
-    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Insert Starter Mining Plans
-INSERT INTO mining_plans (name, hash_power_ghs, price_usd, duration_days, daily_return_btc) VALUES
-('Antminer Starter', 5000.00, 150.00, 30, 0.00004500),
-('Whatsminer Pro', 25000.00, 700.00, 90, 0.00023000),
-('Avalon Mega Hash', 100000.00, 25000.00, 365, 0.00110000);
-require('dotenv').config();
-const express = require('express');
-const { Pool } = require('pg');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { authenticator } = require('otplib');
-const qrcode = require('qrcode');
-const cron = require('node-cron');
-const rateLimit = require('express-rate-limit');
-
-const app = express();
-app.use(express.json());
-
-// Database Pool Connection
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL
-});
-
-// Global Rate Limiter to prevent brute force attacks
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per window
-  message: { error: 'Too many requests from this IP, please try again later.' }
-});
-app.use('/api/', apiLimiter);
-
-/* ==========================================================================
-   MIDDLEWARE: Authentication Check
-   ========================================================================== */
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) return res.status(401).json({ error: 'Access token missing' });
-
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Invalid or expired token' });
-    req.user = user;
-    next();
-  });
-};
-
-/* ==========================================================================
-   ROUTES: User Authentication & 2FA Setup
-   ========================================================================== */
-
-// 1. Registration
-app.post('/api/auth/register', async (req, res) => {
-  const { username, email, password } = req.body;
-  if (!username || !email || !password) return res.status(400).json({ error: 'All fields required' });
-
-  try {
-    const passwordHash = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      'INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email',
-      [username, email, passwordHash]
-    );
-    res.status(201).json({ message: 'User registered successfully', user: result.rows[0] });
-  } catch (err) {
-    if (err.code === '23505') return res.status(400).json({ error: 'Username or email already exists' });
-    res.status(500).json({ error: 'Registration processing error' });
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NEXUS MINE — Cloud Mining Platform</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Bebas+Neue&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --black: #030507;
+    --deep: #080d14;
+    --panel: #0c1520;
+    --border: #1a2d42;
+    --border-bright: #1e4060;
+    --cyan: #00e5ff;
+    --cyan-dim: #007a8a;
+    --gold: #f0a500;
+    --gold-dim: #7a5200;
+    --green: #00ff88;
+    --green-dim: #004422;
+    --red: #ff3355;
+    --text: #8ab0cc;
+    --text-bright: #c8dff0;
+    --text-muted: #3a5470;
+    --mono: 'Share Tech Mono', monospace;
+    --display: 'Bebas Neue', sans-serif;
+    --body: 'DM Sans', sans-serif;
   }
-});
 
-// 2. Login (Handles 2FA routing)
-app.post('/api/auth/login', async (req, res) => {
-  const { email, password, token } = req.body;
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-  try {
-    const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    if (userRes.rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
-    
-    const user = userRes.rows[0];
-    const validPassword = await bcrypt.compare(password, user.password_hash);
-    if (!validPassword) return res.status(401).json({ error: 'Invalid credentials' });
+  html { scroll-behavior: smooth; }
 
-    // Enforce 2FA verification if enabled
-    if (user.twofa_enabled) {
-      if (!token) {
-        return res.status(200).json({ requires2FA: true, message: '2FA verification code required' });
+  body {
+    background: var(--black);
+    color: var(--text);
+    font-family: var(--body);
+    overflow-x: hidden;
+    cursor: none;
+  }
+
+  /* Custom cursor */
+  .cursor {
+    position: fixed;
+    width: 12px; height: 12px;
+    background: var(--cyan);
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 9999;
+    transform: translate(-50%, -50%);
+    transition: transform 0.1s, width 0.2s, height 0.2s, opacity 0.2s;
+    box-shadow: 0 0 12px var(--cyan), 0 0 24px var(--cyan);
+    mix-blend-mode: screen;
+  }
+  .cursor-ring {
+    position: fixed;
+    width: 36px; height: 36px;
+    border: 1px solid rgba(0,229,255,0.4);
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 9998;
+    transform: translate(-50%, -50%);
+    transition: transform 0.15s ease-out, width 0.3s, height 0.3s;
+  }
+
+  /* Grid background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0,229,255,0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,229,255,0.025) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Scanline overlay */
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.08) 2px,
+      rgba(0,0,0,0.08) 4px
+    );
+    pointer-events: none;
+    z-index: 1;
+    animation: scanlines 8s linear infinite;
+  }
+  @keyframes scanlines { from { background-position: 0 0; } to { background-position: 0 100px; } }
+
+  .container { max-width: 1280px; margin: 0 auto; padding: 0 32px; position: relative; z-index: 2; }
+
+  /* NAV */
+  nav {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 100;
+    background: rgba(3,5,7,0.85);
+    backdrop-filter: blur(16px);
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 64px;
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0 32px;
+  }
+  .logo {
+    font-family: var(--display);
+    font-size: 26px;
+    letter-spacing: 4px;
+    color: var(--cyan);
+    text-shadow: 0 0 20px rgba(0,229,255,0.5);
+    text-decoration: none;
+  }
+  .logo span { color: var(--gold); }
+  .nav-links {
+    display: flex;
+    gap: 32px;
+    list-style: none;
+  }
+  .nav-links a {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+  .nav-links a:hover { color: var(--cyan); }
+  .nav-cta {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 2px;
+    padding: 10px 24px;
+    background: transparent;
+    border: 1px solid var(--cyan);
+    color: var(--cyan);
+    cursor: none;
+    text-transform: uppercase;
+    transition: all 0.2s;
+    position: relative;
+    overflow: hidden;
+  }
+  .nav-cta::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: var(--cyan);
+    transform: translateX(-100%);
+    transition: transform 0.25s;
+    z-index: -1;
+  }
+  .nav-cta:hover { color: var(--black); }
+  .nav-cta:hover::before { transform: translateX(0); }
+
+  /* HERO */
+  .hero {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    padding-top: 64px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  /* Animated orbs */
+  .orb {
+    position: absolute;
+    border-radius: 50%;
+    filter: blur(80px);
+    opacity: 0.15;
+    animation: drift 12s ease-in-out infinite;
+  }
+  .orb-1 { width: 600px; height: 600px; background: var(--cyan); top: -200px; right: -200px; animation-delay: 0s; }
+  .orb-2 { width: 400px; height: 400px; background: var(--gold); bottom: -100px; left: -100px; animation-delay: -4s; }
+  .orb-3 { width: 300px; height: 300px; background: var(--green); top: 40%; left: 40%; animation-delay: -8s; }
+  @keyframes drift {
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    33% { transform: translate(30px, -40px) scale(1.05); }
+    66% { transform: translate(-20px, 20px) scale(0.95); }
+  }
+
+  .hero-content { position: relative; z-index: 2; }
+  .hero-tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 4px;
+    color: var(--cyan);
+    text-transform: uppercase;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .hero-tag::before {
+    content: '';
+    width: 32px; height: 1px;
+    background: var(--cyan);
+    display: inline-block;
+  }
+  .hero-title {
+    font-family: var(--display);
+    font-size: clamp(72px, 10vw, 140px);
+    line-height: 0.9;
+    color: var(--text-bright);
+    letter-spacing: 2px;
+    margin-bottom: 12px;
+  }
+  .hero-title .accent { color: var(--cyan); }
+  .hero-title .block { display: block; }
+  .hero-title .gold { color: var(--gold); }
+  .hero-subtitle {
+    font-size: 16px;
+    font-weight: 300;
+    color: var(--text);
+    max-width: 480px;
+    line-height: 1.7;
+    margin-bottom: 48px;
+    margin-top: 24px;
+  }
+  .hero-btns { display: flex; gap: 16px; flex-wrap: wrap; }
+  .btn-primary {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 2px;
+    padding: 16px 40px;
+    background: var(--cyan);
+    color: var(--black);
+    border: none;
+    cursor: none;
+    text-transform: uppercase;
+    font-weight: 700;
+    transition: all 0.2s;
+    clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+  }
+  .btn-primary:hover { background: #fff; transform: translateY(-2px); box-shadow: 0 8px 32px rgba(0,229,255,0.4); }
+  .btn-ghost {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 2px;
+    padding: 16px 40px;
+    background: transparent;
+    color: var(--text-bright);
+    border: 1px solid var(--border-bright);
+    cursor: none;
+    text-transform: uppercase;
+    transition: all 0.2s;
+  }
+  .btn-ghost:hover { border-color: var(--cyan); color: var(--cyan); }
+
+  /* Live stats ticker */
+  .stats-ticker {
+    position: relative;
+    margin-top: 80px;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    padding: 0;
+    overflow: hidden;
+    background: rgba(8,13,20,0.8);
+  }
+  .ticker-inner {
+    display: flex;
+    animation: ticker 30s linear infinite;
+    white-space: nowrap;
+  }
+  .ticker-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 40px;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    border-right: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .ticker-item .val { color: var(--green); }
+  .ticker-item .neg { color: var(--red); }
+  .ticker-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+  @keyframes ticker { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+  /* SECTION LAYOUT */
+  section { padding: 100px 0; position: relative; z-index: 2; }
+  .section-tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 4px;
+    color: var(--cyan-dim);
+    text-transform: uppercase;
+    margin-bottom: 12px;
+  }
+  .section-title {
+    font-family: var(--display);
+    font-size: clamp(42px, 5vw, 72px);
+    color: var(--text-bright);
+    letter-spacing: 2px;
+    line-height: 1;
+    margin-bottom: 16px;
+  }
+  .section-title .accent { color: var(--cyan); }
+  .section-desc {
+    font-size: 15px;
+    color: var(--text);
+    max-width: 520px;
+    line-height: 1.8;
+  }
+  .section-header { margin-bottom: 64px; }
+  .section-header.center { text-align: center; }
+  .section-header.center .section-desc { margin: 0 auto; }
+
+  /* HASHRATE DASHBOARD */
+  .dashboard {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 32px;
+    margin-bottom: 32px;
+    position: relative;
+    overflow: hidden;
+  }
+  .dashboard::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+    animation: scan 3s linear infinite;
+  }
+  @keyframes scan { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+  .dash-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--border);
+  }
+  .dash-cell {
+    background: var(--panel);
+    padding: 24px;
+  }
+  .dash-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 3px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+  .dash-value {
+    font-family: var(--mono);
+    font-size: 28px;
+    color: var(--cyan);
+    letter-spacing: -1px;
+  }
+  .dash-unit {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-left: 4px;
+  }
+  .dash-change {
+    font-family: var(--mono);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .up { color: var(--green); }
+  .down { color: var(--red); }
+
+  /* Hashrate chart */
+  .chart-container {
+    position: relative;
+    height: 160px;
+    margin-top: 24px;
+    overflow: hidden;
+  }
+  canvas#hashChart {
+    width: 100%;
+    height: 100%;
+  }
+
+  /* PLANS */
+  .plans-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    margin-top: 16px;
+  }
+  .plan {
+    background: var(--panel);
+    padding: 40px 32px;
+    position: relative;
+    overflow: hidden;
+    transition: background 0.3s;
+  }
+  .plan:hover { background: rgba(0,229,255,0.03); }
+  .plan.featured {
+    background: linear-gradient(135deg, rgba(0,229,255,0.06), rgba(0,229,255,0.02));
+  }
+  .plan.featured::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: var(--cyan);
+    box-shadow: 0 0 20px var(--cyan);
+  }
+  .plan-badge {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    padding: 4px 12px;
+    background: var(--cyan);
+    color: var(--black);
+    margin-bottom: 24px;
+    font-weight: 700;
+  }
+  .plan-name {
+    font-family: var(--display);
+    font-size: 36px;
+    color: var(--text-bright);
+    letter-spacing: 3px;
+    margin-bottom: 8px;
+  }
+  .plan-hash {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--cyan);
+    margin-bottom: 24px;
+  }
+  .plan-price {
+    font-family: var(--display);
+    font-size: 56px;
+    color: var(--text-bright);
+    line-height: 1;
+    margin-bottom: 4px;
+  }
+  .plan-price span { font-size: 24px; color: var(--text-muted); vertical-align: top; margin-top: 10px; display: inline-block; }
+  .plan-period {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-bottom: 32px;
+  }
+  .plan-features {
+    list-style: none;
+    margin-bottom: 36px;
+  }
+  .plan-features li {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    letter-spacing: 0.5px;
+  }
+  .plan-features li::before { content: '//'; color: var(--cyan-dim); flex-shrink: 0; }
+  .plan-features li.gold-feat::before { content: '//'; color: var(--gold-dim); }
+  .plan-features li.gold-feat { color: var(--gold); }
+  .btn-plan {
+    width: 100%;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 3px;
+    padding: 16px;
+    background: transparent;
+    border: 1px solid var(--border-bright);
+    color: var(--text-bright);
+    cursor: none;
+    text-transform: uppercase;
+    transition: all 0.2s;
+  }
+  .btn-plan:hover, .plan.featured .btn-plan {
+    background: var(--cyan);
+    border-color: var(--cyan);
+    color: var(--black);
+  }
+  .plan.featured .btn-plan:hover { background: #fff; border-color: #fff; }
+
+  /* FEATURES */
+  .features-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+  }
+  .feature {
+    background: var(--panel);
+    padding: 40px 32px;
+    position: relative;
+    overflow: hidden;
+    transition: background 0.3s;
+  }
+  .feature:hover { background: rgba(0,229,255,0.02); }
+  .feature-icon {
+    width: 48px; height: 48px;
+    border: 1px solid var(--border-bright);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 24px;
+    font-size: 20px;
+    transition: all 0.3s;
+  }
+  .feature:hover .feature-icon {
+    border-color: var(--cyan);
+    background: rgba(0,229,255,0.05);
+    box-shadow: 0 0 16px rgba(0,229,255,0.2);
+  }
+  .feature-name {
+    font-family: var(--display);
+    font-size: 22px;
+    letter-spacing: 2px;
+    color: var(--text-bright);
+    margin-bottom: 12px;
+  }
+  .feature-desc {
+    font-size: 14px;
+    color: var(--text);
+    line-height: 1.7;
+  }
+
+  /* HOW IT WORKS */
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; position: relative; }
+  .steps::before {
+    content: '';
+    position: absolute;
+    top: 32px; left: 0; right: 0;
+    height: 1px;
+    background: var(--border-bright);
+    z-index: 0;
+  }
+  .step { padding: 0 24px; position: relative; z-index: 1; }
+  .step-num {
+    width: 64px; height: 64px;
+    border: 1px solid var(--border-bright);
+    background: var(--deep);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono);
+    font-size: 18px;
+    color: var(--cyan);
+    margin-bottom: 32px;
+    position: relative;
+  }
+  .step-num::after {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    background: var(--cyan);
+    opacity: 0;
+    transition: opacity 0.3s;
+    z-index: -1;
+  }
+  .step:hover .step-num::after { opacity: 0.1; }
+  .step-title {
+    font-family: var(--display);
+    font-size: 22px;
+    letter-spacing: 2px;
+    color: var(--text-bright);
+    margin-bottom: 12px;
+  }
+  .step-desc {
+    font-size: 14px;
+    color: var(--text);
+    line-height: 1.7;
+  }
+
+  /* COINS */
+  .coins-grid {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+  }
+  .coin-card {
+    background: var(--panel);
+    padding: 24px 20px;
+    text-align: center;
+    transition: background 0.3s;
+    cursor: none;
+  }
+  .coin-card:hover { background: rgba(240,165,0,0.04); }
+  .coin-symbol {
+    font-family: var(--display);
+    font-size: 28px;
+    letter-spacing: 2px;
+    margin-bottom: 4px;
+  }
+  .coin-name {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-muted);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+  }
+  .coin-roi {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--green);
+  }
+
+  /* TESTIMONIALS */
+  .testimonials-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--border); border: 1px solid var(--border); }
+  .testimonial {
+    background: var(--panel);
+    padding: 36px 32px;
+  }
+  .testimonial-text {
+    font-size: 14px;
+    color: var(--text);
+    line-height: 1.8;
+    margin-bottom: 24px;
+    font-style: italic;
+  }
+  .testimonial-text::before { content: '"'; color: var(--cyan); font-size: 32px; line-height: 0; vertical-align: -0.4em; margin-right: 4px; }
+  .testimonial-author {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: var(--text-bright);
+    text-transform: uppercase;
+  }
+  .testimonial-role {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    letter-spacing: 1px;
+  }
+  .stars { color: var(--gold); font-size: 12px; margin-bottom: 16px; letter-spacing: 2px; }
+
+  /* CTA SECTION */
+  .cta-section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 80px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+  .cta-section::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--cyan), var(--gold), transparent);
+  }
+  .cta-title {
+    font-family: var(--display);
+    font-size: clamp(48px, 6vw, 88px);
+    letter-spacing: 4px;
+    color: var(--text-bright);
+    line-height: 1;
+    margin-bottom: 20px;
+  }
+  .cta-desc {
+    font-size: 16px;
+    color: var(--text);
+    max-width: 480px;
+    margin: 0 auto 40px;
+    line-height: 1.7;
+  }
+
+  /* FOOTER */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 60px 0 32px;
+    position: relative;
+    z-index: 2;
+  }
+  .footer-grid {
+    display: grid;
+    grid-template-columns: 2fr 1fr 1fr 1fr;
+    gap: 48px;
+    margin-bottom: 48px;
+  }
+  .footer-brand { }
+  .footer-logo {
+    font-family: var(--display);
+    font-size: 22px;
+    letter-spacing: 4px;
+    color: var(--cyan);
+    display: block;
+    margin-bottom: 16px;
+    text-decoration: none;
+  }
+  .footer-logo span { color: var(--gold); }
+  .footer-tagline {
+    font-size: 13px;
+    color: var(--text-muted);
+    line-height: 1.7;
+    max-width: 280px;
+    margin-bottom: 24px;
+  }
+  .footer-col-title {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 3px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    margin-bottom: 20px;
+  }
+  .footer-links {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .footer-links a {
+    font-size: 13px;
+    color: var(--text);
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+  .footer-links a:hover { color: var(--cyan); }
+  .footer-bottom {
+    border-top: 1px solid var(--border);
+    padding-top: 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .footer-copy {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    letter-spacing: 1px;
+  }
+  .status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--green);
+    letter-spacing: 1px;
+  }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+
+  /* Terminal block */
+  .terminal {
+    background: #020609;
+    border: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 20px 24px;
+    margin-top: 40px;
+    position: relative;
+  }
+  .terminal::before {
+    content: '● ● ●';
+    display: block;
+    color: var(--border-bright);
+    margin-bottom: 16px;
+    letter-spacing: 8px;
+    font-size: 10px;
+  }
+  .terminal-line { color: var(--text-muted); margin-bottom: 4px; }
+  .terminal-line .cmd { color: var(--cyan); }
+  .terminal-line .val { color: var(--green); }
+  .terminal-line .highlight { color: var(--gold); }
+  .blink { animation: blink 1s step-end infinite; }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+  /* Responsive */
+  @media (max-width: 960px) {
+    .dash-grid { grid-template-columns: repeat(2, 1fr); }
+    .plans-grid { grid-template-columns: 1fr; }
+    .features-grid { grid-template-columns: repeat(2, 1fr); }
+    .steps { grid-template-columns: repeat(2, 1fr); }
+    .coins-grid { grid-template-columns: repeat(3, 1fr); }
+    .footer-grid { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 640px) {
+    .nav-links { display: none; }
+    .features-grid, .steps, .coins-grid, .testimonials-grid { grid-template-columns: 1fr; }
+    .cta-section { padding: 48px 24px; }
+    .footer-grid { grid-template-columns: 1fr; }
+    .container { padding: 0 20px; }
+  }
+
+  /* Animate on scroll */
+  .reveal {
+    opacity: 0;
+    transform: translateY(24px);
+    transition: opacity 0.6s ease, transform 0.6s ease;
+  }
+  .reveal.visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+</style>
+</head>
+<body>
+
+<div class="cursor" id="cursor"></div>
+<div class="cursor-ring" id="cursorRing"></div>
+
+<!-- NAV -->
+<nav>
+  <div class="nav-inner">
+    <a href="#" class="logo">NEXUS<span>MINE</span></a>
+    <ul class="nav-links">
+      <li><a href="#dashboard">Dashboard</a></li>
+      <li><a href="#plans">Plans</a></li>
+      <li><a href="#features">Features</a></li>
+      <li><a href="#how">How It Works</a></li>
+    </ul>
+    <button class="nav-cta">Start Mining</button>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+  <div class="orb orb-3"></div>
+  <div class="container">
+    <div class="hero-content">
+      <div class="hero-tag">Next-gen cloud infrastructure</div>
+      <h1 class="hero-title">
+        <span class="block">MINE THE</span>
+        <span class="block accent">FUTURE</span>
+        <span class="block gold">FROM HOME</span>
+      </h1>
+      <p class="hero-subtitle">Industrial-grade mining power. Zero hardware. Maximum yield. Deploy hashrate in seconds and start earning cryptocurrency around the clock.</p>
+      <div class="hero-btns">
+        <button class="btn-primary">Start Mining Now</button>
+        <button class="btn-ghost">View Live Stats</button>
+      </div>
+      <div class="terminal">
+        <div class="terminal-line"><span class="cmd">$</span> nexus-mine init --pool=btc --hashrate=100TH</div>
+        <div class="terminal-line"><span class="cmd">→</span> Connecting to <span class="highlight">NEXUS_POOL_07</span>...</div>
+        <div class="terminal-line"><span class="cmd">→</span> Hashrate allocated: <span class="val">100.0 TH/s</span></div>
+        <div class="terminal-line"><span class="cmd">→</span> Daily estimate: <span class="val">+0.00042 BTC</span></div>
+        <div class="terminal-line"><span class="cmd">→</span> Status: <span class="val">MINING ACTIVE</span> <span class="blink">█</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="stats-ticker">
+    <div class="ticker-inner" id="ticker">
+      <div class="ticker-item"><span class="ticker-dot"></span> BTC/USD <span class="val">$67,412.08</span></div>
+      <div class="ticker-item">ETH/USD <span class="val">$3,521.44</span></div>
+      <div class="ticker-item">LTC/USD <span class="val">$84.22</span></div>
+      <div class="ticker-item">DOGE/USD <span class="val">$0.1421</span></div>
+      <div class="ticker-item">NETWORK HASHRATE <span class="val">712.4 EH/s</span></div>
+      <div class="ticker-item">ACTIVE MINERS <span class="val">128,432</span></div>
+      <div class="ticker-item">BLOCKS TODAY <span class="val">144</span></div>
+      <div class="ticker-item">AVG BLOCK TIME <span class="val">9m 58s</span></div>
+      <!-- duplicate for seamless loop -->
+      <div class="ticker-item"><span class="ticker-dot"></span> BTC/USD <span class="val">$67,412.08</span></div>
+      <div class="ticker-item">ETH/USD <span class="val">$3,521.44</span></div>
+      <div class="ticker-item">LTC/USD <span class="val">$84.22</span></div>
+      <div class="ticker-item">DOGE/USD <span class="val">$0.1421</span></div>
+      <div class="ticker-item">NETWORK HASHRATE <span class="val">712.4 EH/s</span></div>
+      <div class="ticker-item">ACTIVE MINERS <span class="val">128,432</span></div>
+      <div class="ticker-item">BLOCKS TODAY <span class="val">144</span></div>
+      <div class="ticker-item">AVG BLOCK TIME <span class="val">9m 58s</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- DASHBOARD -->
+<section id="dashboard">
+  <div class="container">
+    <div class="section-header reveal">
+      <div class="section-tag">// Live Performance</div>
+      <h2 class="section-title">MINING <span class="accent">DASHBOARD</span></h2>
+      <p class="section-desc">Real-time metrics from our global mining infrastructure operating 24/7 across 6 data centers.</p>
+    </div>
+    <div class="dashboard reveal">
+      <div class="dash-grid">
+        <div class="dash-cell">
+          <div class="dash-label">Total Hashrate</div>
+          <div class="dash-value">42.8<span class="dash-unit">EH/s</span></div>
+          <div class="dash-change up">↑ 3.2% from yesterday</div>
+        </div>
+        <div class="dash-cell">
+          <div class="dash-label">Active Contracts</div>
+          <div class="dash-value">128,432<span class="dash-unit"></span></div>
+          <div class="dash-change up">↑ 847 new today</div>
+        </div>
+        <div class="dash-cell">
+          <div class="dash-label">BTC Mined (24h)</div>
+          <div class="dash-value">18.24<span class="dash-unit">BTC</span></div>
+          <div class="dash-change up">↑ $1.23M value</div>
+        </div>
+        <div class="dash-cell">
+          <div class="dash-label">Uptime</div>
+          <div class="dash-value">99.97<span class="dash-unit">%</span></div>
+          <div class="dash-change up">↑ SLA guaranteed</div>
+        </div>
+      </div>
+      <div class="chart-container">
+        <canvas id="hashChart"></canvas>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SUPPORTED COINS -->
+<section>
+  <div class="container">
+    <div class="section-header center reveal">
+      <div class="section-tag">// Supported Assets</div>
+      <h2 class="section-title">MINE ANY <span class="accent">COIN</span></h2>
+    </div>
+    <div class="coins-grid reveal">
+      <div class="coin-card"><div class="coin-symbol" style="color:#f7931a">₿</div><div class="coin-name">Bitcoin</div><div class="coin-roi">+8.2% APY</div></div>
+      <div class="coin-card"><div class="coin-symbol" style="color:#627eea">Ξ</div><div class="coin-name">Ethereum</div><div class="coin-roi">+11.4% APY</div></div>
+      <div class="coin-card"><div class="coin-symbol" style="color:#bfbbbb">Ł</div><div class="coin-name">Litecoin</div><div class="coin-roi">+14.8% APY</div></div>
+      <div class="coin-card"><div class="coin-symbol" style="color:#00d4aa">₳</div><div class="coin-name">Cardano</div><div class="coin-roi">+9.6% APY</div></div>
+      <div class="coin-card"><div class="coin-symbol" style="color:#e84142">✕</div><div class="coin-name">Avalanche</div><div class="coin-roi">+16.2% APY</div></div>
+      <div class="coin-card"><div class="coin-symbol" style="color:#cb3837">●</div><div class="coin-name">Monero</div><div class="coin-roi">+12.1% APY</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- PLANS -->
+<section id="plans">
+  <div class="container">
+    <div class="section-header reveal">
+      <div class="section-tag">// Mining Plans</div>
+      <h2 class="section-title">CHOOSE YOUR <span class="accent">POWER</span></h2>
+      <p class="section-desc">Flexible contracts from starter to institutional. Scale your operation at any time.</p>
+    </div>
+    <div class="plans-grid reveal">
+      <div class="plan">
+        <div class="plan-name">STARTER</div>
+        <div class="plan-hash">10 TH/s — SHA-256</div>
+        <div class="plan-price"><span>$</span>29</div>
+        <div class="plan-period">/ month • cancel anytime</div>
+        <ul class="plan-features">
+          <li>10 TH/s Bitcoin hashrate</li>
+          <li>Daily BTC payouts</li>
+          <li>Basic dashboard access</li>
+          <li>Email support</li>
+          <li>0.5% maintenance fee</li>
+        </ul>
+        <button class="btn-plan">Deploy Now</button>
+      </div>
+      <div class="plan featured">
+        <div class="plan-badge">Most Popular</div>
+        <div class="plan-name">MINER</div>
+        <div class="plan-hash">100 TH/s — SHA-256</div>
+        <div class="plan-price"><span>$</span>249</div>
+        <div class="plan-period">/ month • includes bonuses</div>
+        <ul class="plan-features">
+          <li>100 TH/s Bitcoin hashrate</li>
+          <li>Hourly payouts</li>
+          <li>Advanced analytics</li>
+          <li>Multi-coin switching</li>
+          <li class="gold-feat">Priority 24/7 support</li>
+          <li class="gold-feat">Auto-reinvest option</li>
+          <li>0.3% maintenance fee</li>
+        </ul>
+        <button class="btn-plan">Deploy Now</button>
+      </div>
+      <div class="plan">
+        <div class="plan-name">ELITE</div>
+        <div class="plan-hash">1 PH/s — SHA-256</div>
+        <div class="plan-price"><span>$</span>1,899</div>
+        <div class="plan-period">/ month • enterprise grade</div>
+        <ul class="plan-features">
+          <li>1 PH/s Bitcoin hashrate</li>
+          <li>Real-time payouts</li>
+          <li>Dedicated account manager</li>
+          <li>Custom pool allocation</li>
+          <li class="gold-feat">API access</li>
+          <li class="gold-feat">White-label dashboard</li>
+          <li class="gold-feat">0% maintenance fee</li>
+        </ul>
+        <button class="btn-plan">Contact Sales</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section id="features">
+  <div class="container">
+    <div class="section-header center reveal">
+      <div class="section-tag">// Why NexusMine</div>
+      <h2 class="section-title">BUILT FOR <span class="accent">PERFORMANCE</span></h2>
+    </div>
+    <div class="features-grid reveal">
+      <div class="feature">
+        <div class="feature-icon">⚡</div>
+        <div class="feature-name">ZERO DOWNTIME</div>
+        <div class="feature-desc">99.97% uptime SLA backed by redundant power, cooling, and failover systems across our global data center network.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">🔒</div>
+        <div class="feature-name">BANK-GRADE SECURITY</div>
+        <div class="feature-desc">Military-grade encryption, 2FA, cold storage wallets, and real-time threat monitoring protect every asset at all times.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">📊</div>
+        <div class="feature-name">LIVE ANALYTICS</div>
+        <div class="feature-desc">Track your hashrate, earnings, efficiency and ROI in real-time with our institutional-grade monitoring dashboard.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">🌍</div>
+        <div class="feature-name">GLOBAL NETWORK</div>
+        <div class="feature-desc">6 data centers across 4 continents with tier-3 infrastructure, green energy, and sub-millisecond pool latency.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">💰</div>
+        <div class="feature-name">INSTANT PAYOUTS</div>
+        <div class="feature-desc">Withdraw earnings on-demand with no minimum threshold. Daily automatic payouts available on all plans.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-icon">⚙️</div>
+        <div class="feature-name">SMART SWITCHING</div>
+        <div class="feature-desc">AI-powered algorithm automatically routes your hashrate to the most profitable coin at any given moment.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section id="how">
+  <div class="container">
+    <div class="section-header center reveal">
+      <div class="section-tag">// Getting Started</div>
+      <h2 class="section-title">UP IN <span class="accent">MINUTES</span></h2>
+      <p class="section-desc">Four steps from sign-up to active earnings. No hardware, no hassle.</p>
+    </div>
+    <div class="steps reveal">
+      <div class="step">
+        <div class="step-num">01</div>
+        <div class="step-title">CREATE ACCOUNT</div>
+        <div class="step-desc">Register in 60 seconds with just an email. Verify your identity and configure your payout wallet address.</div>
+      </div>
+      <div class="step">
+        <div class="step-num">02</div>
+        <div class="step-title">CHOOSE PLAN</div>
+        <div class="step-desc">Select your desired hashrate and contract duration. From 10 TH/s starter to multi-petahash enterprise contracts.</div>
+      </div>
+      <div class="step">
+        <div class="step-num">03</div>
+        <div class="step-title">DEPLOY POWER</div>
+        <div class="step-desc">Your hashrate goes live within 30 seconds. Our infrastructure begins mining immediately on your behalf.</div>
+      </div>
+      <div class="step">
+        <div class="step-num">04</div>
+        <div class="step-title">EARN DAILY</div>
+        <div class="step-desc">Watch your balance grow. Withdraw to any wallet, reinvest, or compound your position for maximum returns.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- TESTIMONIALS -->
+<section>
+  <div class="container">
+    <div class="section-header center reveal">
+      <div class="section-tag">// Community</div>
+      <h2 class="section-title">TRUSTED BY <span class="accent">MINERS</span></h2>
+    </div>
+    <div class="testimonials-grid reveal">
+      <div class="testimonial">
+        <div class="stars">★★★★★</div>
+        <div class="testimonial-text">Been using NexusMine for 8 months. The dashboard is insane, payouts are on time every day, and their support team actually knows what they're talking about.</div>
+        <div class="testimonial-author">Marcus T.</div>
+        <div class="testimonial-role">Elite Plan // 2.4 PH/s deployed</div>
+      </div>
+      <div class="testimonial">
+        <div class="stars">★★★★★</div>
+        <div class="testimonial-text">Started on the Starter plan, scaled to Elite in 3 months. ROI has been consistently above what they projected. Genuinely impressed.</div>
+        <div class="testimonial-author">Yuki N.</div>
+        <div class="testimonial-role">Miner Plan // 500 TH/s deployed</div>
+      </div>
+      <div class="testimonial">
+        <div class="stars">★★★★★</div>
+        <div class="testimonial-text">The smart-switching feature alone pays for the subscription. It auto-routed me into LTC during a profitability spike and I earned 40% more that week.</div>
+        <div class="testimonial-author">Rodrigo M.</div>
+        <div class="testimonial-role">Miner Plan // 200 TH/s deployed</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<section>
+  <div class="container">
+    <div class="cta-section reveal">
+      <div class="section-tag" style="margin-bottom:16px">// Limited Availability</div>
+      <div class="cta-title">START MINING<br>TODAY</div>
+      <p class="cta-desc">Join 128,000+ miners already earning with NexusMine. New contracts deploying instantly.</p>
+      <div style="display:flex;gap:16px;justify-content:center;flex-wrap:wrap;">
+        <button class="btn-primary">Create Free Account</button>
+        <button class="btn-ghost">View ROI Calculator</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <div class="container">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="#" class="footer-logo">NEXUS<span>MINE</span></a>
+        <p class="footer-tagline">Industrial-grade cloud mining infrastructure operating at the edge of performance since 2019.</p>
+        <div class="status-indicator"><span class="status-dot"></span> All Systems Operational</div>
+      </div>
+      <div>
+        <div class="footer-col-title">Platform</div>
+        <ul class="footer-links">
+          <li><a href="#">Mining Plans</a></li>
+          <li><a href="#">Dashboard</a></li>
+          <li><a href="#">Referral Program</a></li>
+          <li><a href="#">API Access</a></li>
+          <li><a href="#">Mobile App</a></li>
+        </ul>
+      </div>
+      <div>
+        <div class="footer-col-title">Company</div>
+        <ul class="footer-links">
+          <li><a href="#">About Us</a></li>
+          <li><a href="#">Data Centers</a></li>
+          <li><a href="#">Blog</a></li>
+          <li><a href="#">Careers</a></li>
+          <li><a href="#">Press</a></li>
+        </ul>
+      </div>
+      <div>
+        <div class="footer-col-title">Support</div>
+        <ul class="footer-links">
+          <li><a href="#">Help Center</a></li>
+          <li><a href="#">Live Chat</a></li>
+          <li><a href="#">Status Page</a></li>
+          <li><a href="#">Privacy Policy</a></li>
+          <li><a href="#">Terms of Service</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <div class="footer-copy">© 2026 NEXUSMINE INC. ALL RIGHTS RESERVED. // MINING IS RISKY — INVEST WISELY</div>
+      <div class="footer-copy">BTC · ETH · LTC · XMR · ADA · AVAX</div>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // Custom cursor
+  const cursor = document.getElementById('cursor');
+  const ring = document.getElementById('cursorRing');
+  let mx = 0, my = 0, rx = 0, ry = 0;
+  document.addEventListener('mousemove', e => { mx = e.clientX; my = e.clientY; });
+  function animCursor() {
+    cursor.style.left = mx + 'px'; cursor.style.top = my + 'px';
+    rx += (mx - rx) * 0.12; ry += (my - ry) * 0.12;
+    ring.style.left = rx + 'px'; ring.style.top = ry + 'px';
+    requestAnimationFrame(animCursor);
+  }
+  animCursor();
+
+  // Scroll reveal
+  const reveals = document.querySelectorAll('.reveal');
+  const io = new IntersectionObserver(entries => {
+    entries.forEach((e, i) => {
+      if (e.isIntersecting) {
+        setTimeout(() => e.target.classList.add('visible'), i * 60);
+        io.unobserve(e.target);
       }
-      const isTokenValid = authenticator.check(token, user.twofa_secret);
-      if (!isTokenValid) return res.status(401).json({ error: 'Invalid 2FA code verification' });
+    });
+  }, { threshold: 0.1 });
+  reveals.forEach(el => io.observe(el));
+
+  // Hashrate chart
+  const canvas = document.getElementById('hashChart');
+  const ctx = canvas.getContext('2d');
+  canvas.width = canvas.offsetWidth || 1200;
+  canvas.height = 160;
+
+  function generateHashData(points) {
+    const data = [];
+    let v = 40;
+    for (let i = 0; i < points; i++) {
+      v += (Math.random() - 0.48) * 3;
+      v = Math.max(30, Math.min(55, v));
+      data.push(v);
+    }
+    return data;
+  }
+
+  let chartData = generateHashData(80);
+  let offset = 0;
+
+  function drawChart() {
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const pts = chartData;
+    const minV = 25, maxV = 60;
+    const scaleY = v => h - ((v - minV) / (maxV - minV)) * h * 0.8 - h * 0.1;
+    const scaleX = i => (i / (pts.length - 1)) * w;
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(26,45,66,0.6)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = (i / 4) * h;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
     }
 
-    // Generate authenticated session token
-    const accessToken = jwt.sign({ id: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '2h' });
-    res.json({ accessToken, username: user.username });
-  } catch (err) {
-    res.status(500).json({ error: 'Internal server login error' });
+    // Gradient fill
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, 'rgba(0,229,255,0.18)');
+    grad.addColorStop(1, 'rgba(0,229,255,0)');
+    ctx.beginPath();
+    ctx.moveTo(scaleX(0), h);
+    pts.forEach((v, i) => {
+      if (i === 0) ctx.lineTo(scaleX(i), scaleY(v));
+      else {
+        const px = scaleX(i - 1), py = scaleY(pts[i - 1]);
+        const nx = scaleX(i), ny = scaleY(v);
+        const cpx = (px + nx) / 2;
+        ctx.bezierCurveTo(cpx, py, cpx, ny, nx, ny);
+      }
+    });
+    ctx.lineTo(scaleX(pts.length - 1), h);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    pts.forEach((v, i) => {
+      if (i === 0) ctx.moveTo(scaleX(i), scaleY(v));
+      else {
+        const px = scaleX(i - 1), py = scaleY(pts[i - 1]);
+        const nx = scaleX(i), ny = scaleY(v);
+        const cpx = (px + nx) / 2;
+        ctx.bezierCurveTo(cpx, py, cpx, ny, nx, ny);
+      }
+    });
+    ctx.strokeStyle = 'rgba(0,229,255,0.9)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Glow line
+    ctx.beginPath();
+    pts.forEach((v, i) => {
+      if (i === 0) ctx.moveTo(scaleX(i), scaleY(v));
+      else {
+        const px = scaleX(i - 1), py = scaleY(pts[i - 1]);
+        const nx = scaleX(i), ny = scaleY(v);
+        const cpx = (px + nx) / 2;
+        ctx.bezierCurveTo(cpx, py, cpx, ny, nx, ny);
+      }
+    });
+    ctx.strokeStyle = 'rgba(0,229,255,0.3)';
+    ctx.lineWidth = 6;
+    ctx.stroke();
+
+    // Label
+    ctx.fillStyle = 'rgba(0,229,255,0.5)';
+    ctx.font = '10px Share Tech Mono';
+    ctx.fillText('HASHRATE (EH/s) — LIVE', 12, 16);
   }
-});
 
-// 3. Request 2FA Activation QR Code
-app.post('/api/auth/2fa/setup', authenticateToken, async (req, res) => {
-  try {
-    const secret = authenticator.generateSecret();
-    const otpauth = authenticator.keyuri(req.user.username, 'CloudMiningPlatform', secret);
-    
-    await pool.query('UPDATE users SET twofa_secret = $1 WHERE id = $2', [secret, req.user.id]);
-    const qrCodeImage = await qrcode.toDataURL(otpauth);
-    
-    res.json({ secret, qrCodeImage, instructions: 'Scan QR code in Google Authenticator or Authy' });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to generate 2FA infrastructure' });
-  }
-});
+  drawChart();
 
-// 4. Confirm and Enable 2FA Activation
-app.post('/api/auth/2fa/verify', authenticateToken, async (req, res) => {
-  const { token } = req.body;
+  // Live update simulation
+  setInterval(() => {
+    const last = chartData[chartData.length - 1];
+    const next = Math.max(30, Math.min(55, last + (Math.random() - 0.48) * 2));
+    chartData.shift();
+    chartData.push(next);
+    drawChart();
+    // update dash value
+    document.querySelector('.dash-value').textContent = next.toFixed(1);
+  }, 1200);
 
-  try {
-    const userRes = await pool.query('SELECT twofa_secret FROM users WHERE id = $1', [req.user.id]);
-    const secret = userRes.rows[0].twofa_secret;
+  // Resize
+  window.addEventListener('resize', () => {
+    canvas.width = canvas.offsetWidth;
+    drawChart();
+  });
 
-    const isValid = authenticator.check(token, secret);
-    if (!isValid) return res.status(400).json({ error: 'Invalid verification token' });
-
-    await pool.query('UPDATE users SET twofa_enabled = true WHERE id = $1', [req.user.id]);
-    res.json({ success: true, message: 'Two-factor authentication successfully enabled' });
-  } catch (err) {
-    res.status(500).json({ error: 'Verification pipeline error' });
-  }
-});
-
-/* ==========================================================================
-   ROUTES: Commercial Platform Contract Control Engine
-   ========================================================================== */
-
-// Fetch active available investment storefront items
-app.get('/api/plans', async (req, res) => {
-  try {
-    const plans = await pool.query('SELECT * FROM mining_plans WHERE is_active = true');
-    res.json(plans.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Database execution error' });
-  }
-});
-
-// Secure atomic multi-step balance deduction and allocation engine
-app.post('/api/contracts/purchase', authenticateToken, async (req, res) => {
-  const { planId } = req.body;
-  const userId = req.user.id;
-  
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    
-    const planRes = await client.query('SELECT * FROM mining_plans WHERE id = $1 AND is_active = true', [planId]);
-    if (planRes.rows.length === 0) {
-      client.release();
-      return res.status(404).json({ error: 'Mining framework plan missing' });
+  // Live counter animation
+  function animateCounter(el, target, decimals = 0) {
+    const dur = 2000, start = performance.now();
+    const from = 0;
+    function step(now) {
+      const t = Math.min((now - start) / dur, 1);
+      const ease = 1 - Math.pow(1 - t, 3);
+      const val = from + (target - from) * ease;
+      el.textContent = decimals > 0 ? val.toFixed(decimals) : Math.floor(val).toLocaleString();
+      if (t < 1) requestAnimationFrame(step);
     }
-    const plan = planRes.rows[0];
-
-    const userRes = await client.query('SELECT balance_btc FROM users WHERE id = $1 FOR UPDATE', [userId]);
-    const currentBalance = parseFloat(userRes.rows[0].balance_btc);
-
-    // Mock calculations (In production, replace 65000 with a dynamic API call like Axios fetching from CoinGecko)
-    const currentBtcRate = 65000;
-    const planCostInBtc = parseFloat((plan.price_usd / currentBtcRate).toFixed(8));
-
-    if (currentBalance < planCostInBtc) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: `Insufficient BTC. Need: ${planCostInBtc} BTC, Have: ${currentBalance} BTC` });
-    }
-
-    // Process Transaction safely
-    await client.query('UPDATE users SET balance_btc = balance_btc - $1 WHERE id = $2', [planCostInBtc, userId]);
-    
-    const expiryDate = new Date();
-    expiryDate.setDate(expiryDate.getDate() + plan.duration_days);
-
-    await client.query(
-      'INSERT INTO user_contracts (user_id, plan_id, expiry_date) VALUES ($1, $2, $3)',
-      [userId, planId, expiryDate]
-    );
-
-    await client.query('COMMIT');
-    res.json({ success: true, debited: planCostInBtc, message: 'Contract initialized, hashing running.' });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Purchase engine failure:', err);
-    res.status(500).json({ error: 'Transaction engine runtime exception' });
-  } finally {
-    client.release();
+    requestAnimationFrame(step);
   }
-});
-
-/* ==========================================================================
-   CRON: Automated Ledger Distribution Routine
-   ========================================================================== */
-// Executed at midnight daily ('0 0 * * *'). For testing execution alternative, change string to '*/5 * * * * *' (every 5s)
-cron.schedule('0 0 * * *', async () => {
-  console.log('[System Engine] Syncing distributed cluster daily payouts...');
-  const client = await pool.connect();
-  
-  try {
-    await client.query('BEGIN');
-
-    const activeContracts = await client.query(`
-      SELECT uc.id as contract_id, uc.user_id, mp.daily_return_btc 
-      FROM user_contracts uc
-      JOIN mining_plans mp ON uc.plan_id = mp.id
-      WHERE uc.status = 'active' AND uc.expiry_date > NOW()
-    `);
-
-    for (let contract of activeContracts.rows) {
-      await client.query('UPDATE users SET balance_btc = balance_btc + $1 WHERE id = $2', [contract.daily_return_btc, contract.user_id]);
-      await client.query('INSERT INTO payouts (user_id, contract_id, amount_btc) VALUES ($1, $2, $3)', [contract.user_id, contract.contract_id, contract.daily_return_btc]);
-    }
-
-    // Automatically transition expired contracts to an expired state
-    const expiredResolution = await client.query("UPDATE user_contracts SET status = 'expired' WHERE expiry_date <= NOW() AND status = 'active' RETURNING id");
-    if(expiredResolution.rowCount > 0) console.log(`[System Engine] Cleaned up ${expiredResolution.rowCount} expired allocations.`);
-
-    await client.query('COMMIT');
-    console.log('[System Engine] Dispatched distributed payouts successfully.');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('[Critical Cron Error] Mining ledger resolution failure:', err);
-  } finally {
-    client.release();
-  }
-});
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`--- Server ready & online running on port ${PORT} ---`));
-# 1. Register an Account
-curl -X POST http://localhost:5000/api/auth/register \
-     -H "Content-Type: application/json" \
-     -d '{"username": "miner1", "email": "miner1@test.com", "password": "SecurePassword123"}'
-
-# 2. Login to get a token (Note: Database default seeds users with 0.05 BTC for simulation)
-curl -X POST http://localhost:5000/api/auth/login \
-     -H "Content-Type: application/json" \
-     -d '{"email": "miner1@test.com", "password": "SecurePassword123"}'
-
-# 3. Request a 2FA Key and QR Code string using the token returned from the login step
-curl -X POST http://localhost:5000/api/auth/2fa/setup \
-     -H "Authorization: Bearer <YOUR_JWT_TOKEN>"
-
-# 4. Finalize contract processing
-curl -X POST http://localhost:5000/api/contracts/purchase \
-     -H "Authorization: Bearer <YOUR_JWT_TOKEN>" \
-     -H "Content-Type: application/json" \
-     -d '{"planId": 1}'
+</script>
+</body>
+</html>
