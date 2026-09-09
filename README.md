@@ -1,1 +1,1 @@
-# Minig
+# nexus-mining
